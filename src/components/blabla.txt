@@ -1,0 +1,284 @@
+/* global cv */
+import React, { useEffect, useRef } from 'react';
+import * as tf from '@tensorflow/tfjs';
+
+export default function LiveVideoFull({ isPlaying, isRecording, setVideoURL }) {
+  const videoRef = useRef(null);
+  const canvasOverlayRef = useRef(null);
+  const canvasRecordRef = useRef(null);
+  const streamRef = useRef(null);
+  const recorderRef = useRef(null);
+  const modelRef = useRef(null);
+  const intervalRef = useRef(null);
+  const sleepCounterRef = useRef(0);
+  const isModelReadyRef = useRef(false);
+
+  const MODEL_INPUT_SIZE = 64;
+
+  const loadModelAndCascade = async () => {
+    try {
+      modelRef.current = await tf.loadGraphModel('/models/model.json');
+
+      const [faceData, eyeData] = await Promise.all([
+        fetch('/haarcascade_frontalface_default.xml').then(res => res.arrayBuffer()),
+        fetch('/haarcascade_eye.xml').then(res => res.arrayBuffer())
+      ]);
+
+      cv.FS_createDataFile('/', 'face.xml', new Uint8Array(faceData), true, false);
+      cv.FS_createDataFile('/', 'eye.xml', new Uint8Array(eyeData), true, false);
+
+      isModelReadyRef.current = true;
+      console.log("Model dan cascade siap.");
+    } catch (err) {
+      console.error('Gagal memuat model atau cascade:', err);
+    }
+  };
+
+  const startVideo = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    streamRef.current = stream;
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+    }
+  };
+
+  const stopVideo = () => {
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+    if (videoRef.current) videoRef.current.srcObject = null;
+  };
+
+  const startDetection = () => {
+    if (!isModelReadyRef.current) {
+      console.warn("Model dan cascade belum siap.");
+      return;
+    }
+
+    const video = videoRef.current;
+    const overlayCanvas = canvasOverlayRef.current;
+    const recordCanvas = canvasRecordRef.current;
+    const ctx = overlayCanvas.getContext('2d');
+    const recordCtx = recordCanvas.getContext('2d');
+
+    const updateCanvasSize = () => {
+      overlayCanvas.width = video.videoWidth;
+      overlayCanvas.height = video.videoHeight;
+      recordCanvas.width = video.videoWidth;
+      recordCanvas.height = video.videoHeight;
+    };
+
+    updateCanvasSize();
+
+    const faceCascade = new cv.CascadeClassifier();
+    const eyeCascade = new cv.CascadeClassifier();
+    if (!faceCascade.load('face.xml')) {
+      console.error('Gagal memuat face cascade.');
+      return;
+    }
+    if (!eyeCascade.load('eye.xml')) {
+      console.error('Gagal memuat eye cascade.');
+      return;
+    }
+
+    intervalRef.current = setInterval(() => {
+      if (video.videoWidth === 0 || video.videoHeight === 0) return;
+
+      ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+      recordCtx.drawImage(video, 0, 0, overlayCanvas.width, overlayCanvas.height);
+
+      const src = cv.imread(recordCanvas);
+      const gray = new cv.Mat();
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+
+      const faces = new cv.RectVector();
+      faceCascade.detectMultiScale(gray, faces, 1.1, 5);
+
+      let drowsyDetected = false;
+
+      for (let i = 0; i < faces.size(); ++i) {
+        const face = faces.get(i);
+
+        // Gambar kotak wajah
+        ctx.strokeStyle = 'cyan';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(face.x, face.y, face.width, face.height);
+        recordCtx.strokeStyle = 'cyan';
+        recordCtx.lineWidth = 2;
+        recordCtx.strokeRect(face.x, face.y, face.width, face.height);
+
+        const roiGray = gray.roi(face);
+        const eyes = new cv.RectVector();
+        eyeCascade.detectMultiScale(roiGray, eyes);
+
+        for (let j = 0; j < eyes.size(); ++j) {
+          const eyeRect = eyes.get(j);
+          if (
+            eyeRect.width < 10 ||
+            eyeRect.height < 10 ||
+            eyeRect.y > face.height * 2 / 3
+          ) continue;
+
+          const x = eyeRect.x;
+          const y = eyeRect.y;
+          const w = eyeRect.width;
+          const h = eyeRect.height;
+
+          if (x < 0 || y < 0 || x + w > roiGray.cols || y + h > roiGray.rows) continue;
+
+          const eyeMat = roiGray.roi(new cv.Rect(x, y, w, h));
+          const resized = new cv.Mat();
+          cv.resize(eyeMat, resized, new cv.Size(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE));
+
+          const tensor = tf.tidy(() => {
+            const imgTensor = tf.tensor(resized.data, [MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 1]);
+            return imgTensor.div(255.0).expandDims(0);
+          });
+
+          const prediction = modelRef.current.predict(tensor).dataSync()[0];
+          const status = prediction > 0.5 ? 'Open' : 'Closed';
+          const color = status === 'Open' ? 'lime' : 'red';
+
+          if (status === 'Closed') drowsyDetected = true;
+
+          // Gambar kotak dan status mata
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(face.x + x, face.y + y, w, h);
+          ctx.font = '12px sans-serif';
+          ctx.fillStyle = color;
+          ctx.fillText(status, face.x + x, face.y + y - 5);
+
+          recordCtx.strokeStyle = color;
+          recordCtx.lineWidth = 2;
+          recordCtx.strokeRect(face.x + x, face.y + y, w, h);
+          recordCtx.font = '12px sans-serif';
+          recordCtx.fillStyle = color;
+          recordCtx.fillText(status, face.x + x, face.y + y - 5);
+
+          resized.delete();
+          eyeMat.delete();
+        }
+
+        roiGray.delete();
+        eyes.delete();
+      }
+
+      if (drowsyDetected) {
+        sleepCounterRef.current++;
+      } else {
+        sleepCounterRef.current = 0;
+      }
+
+      if (sleepCounterRef.current >= 10) {
+        ctx.fillStyle = 'red';
+        ctx.font = '24px sans-serif';
+        ctx.fillText('Mengantuk terdeteksi', 10, 40);
+
+        recordCtx.fillStyle = 'red';
+        recordCtx.font = '24px sans-serif';
+        recordCtx.fillText('Mengantuk terdeteksi', 10, 40);
+      }
+
+      src.delete();
+      gray.delete();
+      faces.delete();
+    }, 100);
+  };
+
+  const stopDetection = () => {
+    clearInterval(intervalRef.current);
+  };
+
+  const startRecording = () => {
+    const stream = canvasRecordRef.current.captureStream(25);
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+      ? 'video/webm;codecs=vp9'
+      : 'video/webm';
+    const recorder = new MediaRecorder(stream, { mimeType });
+    const chunks = [];
+
+    recorder.ondataavailable = e => {
+      if (e.data.size > 0) chunks.push(e.data);
+    };
+
+    recorder.onstop = () => {
+      const blob = new Blob(chunks, { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      if (setVideoURL) setVideoURL(url);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'rekaman-deteksi.webm';
+      a.click();
+    };
+
+    recorder.start();
+    recorderRef.current = recorder;
+  };
+
+  const stopRecording = () => {
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      setTimeout(() => recorderRef.current.stop(), 1000);
+    }
+  };
+
+  useEffect(() => {
+    if (cv.getBuildInformation) {
+      loadModelAndCascade();
+    } else {
+      cv['onRuntimeInitialized'] = loadModelAndCascade;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isPlaying) {
+      startVideo().then(() => {
+        videoRef.current?.addEventListener('loadedmetadata', () => {
+          startDetection();
+        });
+      });
+    } else {
+      stopRecording();
+      stopDetection();
+      stopVideo();
+    }
+
+    return () => {
+      stopRecording();
+      stopDetection();
+      stopVideo();
+    };
+  }, [isPlaying]);
+
+  useEffect(() => {
+    if (isRecording) {
+      startRecording();
+    } else {
+      stopRecording();
+    }
+  }, [isRecording]);
+
+  return (
+    <div className="relative w-full max-w-md mx-auto">
+      <video
+        ref={videoRef}
+        autoPlay
+        muted
+        width="640"
+        height="480"
+        className="rounded shadow"
+      />
+      <canvas
+        ref={canvasOverlayRef}
+        width="640"
+        height="480"
+        className="absolute top-0 left-0 pointer-events-none"
+      />
+      <canvas
+        ref={canvasRecordRef}
+        width="640"
+        height="480"
+        className="absolute top-0 left-0 opacity-0 pointer-events-none"
+      />
+    </div>
+  );
+}
