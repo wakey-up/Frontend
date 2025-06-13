@@ -9,10 +9,7 @@ const Register = () => {
   const [error, setError] = useState(''); // State buat nampilin pesan error
   const navigate = useNavigate();
 
-  // URL API backend lo. Pastikan ini sesuai dengan port Hapi.js lo.
-  // Jika backend lo jalan di http://localhost:3000, maka biarkan ini.
-  // Jika di http://localhost:5000, ubah ke 5000.
-  const API_URL = 'http://localhost:3000'; 
+  const API_URL = 'https://backend-ek84.onrender.com'; 
 
   const handleSubmit = async (e) => { // Tambahkan 'async' karena akan ada await
     e.preventDefault();

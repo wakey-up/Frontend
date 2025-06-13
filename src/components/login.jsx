@@ -10,9 +10,7 @@ const Login = () => {
   const [error, setError] = useState('');
   const navigate = useNavigate();
 
-  // URL API backend lo. Ini bisa jadi 'http://localhost:5000' atau sesuai port Hapi.js lo.
-  // Lebih bagus lagi pakai .env.local seperti saran sebelumnya: process.env.REACT_APP_API_URL
-  const API_URL = 'http://localhost:3000'; 
+  const API_URL = 'https://backend-ek84.onrender.com'; 
 
   const handleSubmit = async (e) => {
     e.preventDefault();
